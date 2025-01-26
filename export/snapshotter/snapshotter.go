@@ -1,8 +1,10 @@
 package snapshotter
 
 import (
-	"github.com/containerd/containerd/platforms"
-	"github.com/containerd/containerd/plugin"
+	"github.com/containerd/containerd/v2/plugins"
+	"github.com/containerd/platforms"
+	"github.com/containerd/plugin"
+	"github.com/containerd/plugin/registry"
 	"github.com/pkg/errors"
 
 	"github.com/containerd/nydus-snapshotter/config"
@@ -10,23 +12,25 @@ import (
 )
 
 func init() {
-	plugin.Register(&plugin.Registration{
-		Type:   plugin.SnapshotPlugin,
+	registry.Register(&plugin.Registration{
+		Type:   plugins.SnapshotPlugin,
 		ID:     "nydus",
-		Config: &config.Config{},
+		Config: &config.SnapshotterConfig{},
 		InitFn: func(ic *plugin.InitContext) (interface{}, error) {
 			ic.Meta.Platforms = append(ic.Meta.Platforms, platforms.DefaultSpec())
 
-			cfg, ok := ic.Config.(*config.Config)
+			cfg, ok := ic.Config.(*config.SnapshotterConfig)
 			if !ok {
 				return nil, errors.New("invalid nydus snapshotter configuration")
 			}
 
-			if cfg.RootDir == "" {
-				cfg.RootDir = ic.Root
+			root := ic.Properties[plugins.PropertyRootDir]
+			if root == "" {
+				cfg.Root = root
 			}
-			if err := cfg.FillupWithDefaults(); err != nil {
-				return nil, errors.New("failed to fillup nydus configuration with defaults")
+
+			if err := cfg.FillUpWithDefaults(); err != nil {
+				return nil, errors.New("failed to fill up nydus configuration with defaults")
 			}
 
 			rs, err := snapshot.NewSnapshotter(ic.Context, cfg)

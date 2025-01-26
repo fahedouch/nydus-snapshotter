@@ -8,13 +8,14 @@ package auth
 
 import (
 	"encoding/base64"
-	"errors"
 	"fmt"
 	"strings"
 
-	"github.com/google/go-containerregistry/pkg/authn"
+	"github.com/pkg/errors"
 
 	"github.com/containerd/nydus-snapshotter/pkg/label"
+	distribution "github.com/distribution/reference"
+	"github.com/google/go-containerregistry/pkg/authn"
 )
 
 const (
@@ -34,7 +35,7 @@ type PassKeyChain struct {
 func FromBase64(str string) (PassKeyChain, error) {
 	decoded, err := base64.StdEncoding.DecodeString(str)
 	if err != nil {
-		return emptyPassKeyChain, nil
+		return emptyPassKeyChain, err
 	}
 	pair := strings.Split(string(decoded), sep)
 	if len(pair) != 2 {
@@ -60,15 +61,15 @@ func (kc PassKeyChain) TokenBase() bool {
 }
 
 // FromLabels finds image pull username and secret from snapshot labels.
-// Returned `nil` means no validated username and secrect are passed, it should
+// Returned `nil` means no valid username and secret is passed, it should
 // not override input nydusd configuration.
 func FromLabels(labels map[string]string) *PassKeyChain {
-	u, found := labels[label.ImagePullUsername]
+	u, found := labels[label.NydusImagePullUsername]
 	if !found || u == "" {
 		return nil
 	}
 
-	p, found := labels[label.ImagePullSecret]
+	p, found := labels[label.NydusImagePullSecret]
 	if !found || p == "" {
 		return nil
 	}
@@ -79,18 +80,44 @@ func FromLabels(labels map[string]string) *PassKeyChain {
 	}
 }
 
-// GetRegistryKeyChain get image pull kaychain from (ordered):
+// GetRegistryKeyChain get image pull keychain from (ordered):
 // 1. username and secrets labels
-// 2. docker config
-func GetRegistryKeyChain(host string, labels map[string]string) *PassKeyChain {
+// 2. cri request
+// 3. docker config
+// 4. k8s docker config secret
+func GetRegistryKeyChain(host, ref string, labels map[string]string) *PassKeyChain {
 	kc := FromLabels(labels)
 	if kc != nil {
 		return kc
 	}
-	return FromDockerConfig(host)
+
+	// TODO: Handle error
+	kc, _ = FromCRI(host, ref)
+	if kc != nil {
+		return kc
+	}
+
+	kc = FromDockerConfig(host)
+	if kc != nil {
+		return kc
+	}
+
+	return FromKubeSecretDockerConfig(host)
 }
 
-func (kc PassKeyChain) Resolve(target authn.Resource) (authn.Authenticator, error) {
+func GetKeyChainByRef(ref string, labels map[string]string) (*PassKeyChain, error) {
+	named, err := distribution.ParseDockerRef(ref)
+	if err != nil {
+		return nil, errors.Wrapf(err, "parse ref %s", ref)
+	}
+
+	host := distribution.Domain(named)
+	keychain := GetRegistryKeyChain(host, ref, labels)
+
+	return keychain, nil
+}
+
+func (kc PassKeyChain) Resolve(_ authn.Resource) (authn.Authenticator, error) {
 	return authn.FromConfig(kc.toAuthConfig()), nil
 }
 

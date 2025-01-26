@@ -2,92 +2,113 @@ name: CI
 
 on:
   push:
-    branches: ["*"]
+    branches: ["**", "stable/**"]
   pull_request:
-    branches: [main]
+    branches: ["**", "stable/**"]
 
 env:
-  NYDUS_VERSION: v2.0.0-rc.2
+  CARGO_TERM_COLOR: always
 
 jobs:
   build:
-    name: Build
+    name: Build and Lint
     timeout-minutes: 10
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
-      - name: Set up Go
-        uses: actions/setup-go@v3
-        with:
-          go-version: '1.17'
       - name: Check out code
-        uses: actions/checkout@v1
-      - name: cache go mod
-        uses: actions/cache@v2
+        uses: actions/checkout@v4
+      - name: Setup Golang
+        uses: actions/setup-go@v5
         with:
-          path: ~/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ hashFiles('go.sum') }}
-          restore-keys: |
-            ${{ runner.os }}-go
+          go-version-file: 'go.mod'
+          cache-dependency-path: "go.sum"
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v1.59
+          skip-cache: true
       - name: Build
         run: |
-          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(go env GOPATH)/bin v1.43.0
-          export PATH=$PATH:$(go env GOPATH)/bin
           make
           make test
-          make check
-
+  build-optimizer:
+    name: Build optimizer
+    timeout-minutes: 10
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+      - name: Setup Golang
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          cache-dependency-path: "go.sum"
+      - name: Build
+        run: |
+          rustup component add rustfmt clippy
+          make build-optimizer
   smoke:
     name: Smoke
     timeout-minutes: 10
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
-      - name: Set up Go
-        uses: actions/setup-go@v3
-        with:
-          go-version: '1.17'
       - name: Check out code
-        uses: actions/checkout@v1
-      - name: cache go mod
-        uses: actions/cache@v2
+        uses: actions/checkout@v4
+      - name: Setup Golang
+        uses: actions/setup-go@v5
         with:
-          path: ~/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ hashFiles('go.sum') }}
-          restore-keys: |
-            ${{ runner.os }}-go
+          go-version-file: 'go.mod'
+          cache-dependency-path: "go.sum"
+      - name: Set up containerd
+        uses: crazy-max/ghaction-setup-containerd@v3
       - name: Build
         run: |
           # Download nydus components
-          wget https://github.com/dragonflyoss/image-service/releases/download/${{ env.NYDUS_VERSION }}/nydus-static-${{ env.NYDUS_VERSION }}-x86_64.tgz
-          tar xzvf nydus-static-${{ env.NYDUS_VERSION }}-x86_64.tgz
+          NYDUS_VER=v$(curl -fsSL --header 'authorization: Bearer ${{ secrets.GITHUB_TOKEN }}' "https://api.github.com/repos/dragonflyoss/nydus/releases/latest" | jq -r .tag_name | sed 's/^v//')
+          wget -q https://github.com/dragonflyoss/nydus/releases/download/$NYDUS_VER/nydus-static-$NYDUS_VER-linux-amd64.tgz
+          tar xzvf nydus-static-$NYDUS_VER-linux-amd64.tgz
           mkdir -p /usr/bin
-          sudo mv nydus-static/nydus-image nydus-static/nydusd-fusedev nydus-static/nydusify /usr/bin/
-
+          sudo mv nydus-static/nydus-image nydus-static/nydusd nydus-static/nydusify /usr/bin/
           export PATH=$PATH:$(go env GOPATH)/bin
           make smoke
+
+  cross-build-test:
+    name: Cross Build Test
+    timeout-minutes: 10
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        GOOS: ["linux", "windows", "darwin"]
+        GOARCH: ["amd64", "arm64"]
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+      - name: Setup Golang
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          cache-dependency-path: "go.sum"
+      - name: Build
+        run: |
+          make -e GOOS=${{ matrix.GOOS }} GOARCH=${{ matrix.GOARCH }} converter
 
   coverage:
     name: Code coverage
     timeout-minutes: 10
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     needs: [build]
     steps:
-      - name: Install Go
-        uses: actions/setup-go@v3
-        with:
-          go-version: '1.17'
       - name: Checkout code
-        uses: actions/checkout@v2
-      - name: cache go mod
-        uses: actions/cache@v2
+        uses: actions/checkout@v4
+      - name: Setup Golang
+        uses: actions/setup-go@v5
         with:
-          path: ~/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ hashFiles('go.sum') }}
-          restore-keys: |
-            ${{ runner.os }}-go
+          go-version-file: 'go.mod'
+          cache-dependency-path: "go.sum"
       - name: Run unit tests.
         run: make cover
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v1
+        uses: codecov/codecov-action@v4
         with:
           token: ${{ secrets.CODECOV_TOKEN }} # not required for public repos
           files: ./coverage.txt

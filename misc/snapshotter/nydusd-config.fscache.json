@@ -1,0 +1,13 @@
+{
+    "type": "bootstrap",
+    "config": {
+        "backend_type": "registry",
+        "backend_config": {},
+        "cache_type": "fscache",
+        "prefetch_config": {
+            "enable": true,
+            "threads_count": 8,
+            "merging_size": 1048576
+        }
+    }
+}

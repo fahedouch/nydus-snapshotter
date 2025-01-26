@@ -1,0 +1,109 @@
+name: optimizer test
+
+on:
+  push:
+    branches:
+      - "main"
+    tags:
+      - v[0-9]+.[0-9]+.[0-9]+
+  pull_request:
+    branches:
+      - "main"
+  schedule:
+    # Trigger test every day at 00:03 clock UTC
+    - cron: "3 0 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  run_optimizer:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Setup Golang
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          cache-dependency-path: "go.sum"
+      - name: cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            tools/optimizer-server/target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('tools/optimizer-server/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo
+      - name: containerd runc and crictl
+        run: |
+          sudo wget -q https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.26.0/crictl-v1.26.0-linux-amd64.tar.gz
+          sudo tar zxvf ./crictl-v1.26.0-linux-amd64.tar.gz -C /usr/local/bin
+          sudo install -D -m 755 misc/optimizer/crictl.yaml /etc/crictl.yaml
+          sudo wget -q https://github.com/containerd/containerd/releases/download/v1.7.0/containerd-static-1.7.0-linux-amd64.tar.gz
+          sudo systemctl stop containerd
+          sudo tar -zxf ./containerd-static-1.7.0-linux-amd64.tar.gz -C /usr/
+          sudo install -D -m 755 misc/optimizer/containerd-config.toml /etc/containerd/config.toml
+          sudo systemctl restart containerd
+          sudo wget -q https://github.com/opencontainers/runc/releases/download/v1.1.5/runc.amd64 -O /usr/bin/runc
+          sudo chmod +x /usr/bin/runc
+      - name: Setup CNI
+        run: |
+          wget -q https://github.com/containernetworking/plugins/releases/download/v1.2.0/cni-plugins-linux-amd64-v1.2.0.tgz
+          sudo mkdir -p /opt/cni/bin
+          sudo tar xzf cni-plugins-linux-amd64-v1.2.0.tgz -C /opt/cni/bin/
+          sudo install -D -m 755 misc/example/10-containerd-net.conflist /etc/cni/net.d/10-containerd-net.conflist
+      - name: Build and install optimizer
+        run: |
+          rustup component add rustfmt clippy
+          make optimizer
+          sudo chown -R $(id -un):$(id -gn) . ~/.cargo/
+          pwd
+          ls -lh bin/*optimizer*
+          sudo make install-optimizer
+          sudo install -D -m 755 misc/example/optimizer-nri-plugin.conf /etc/nri/conf.d/02-optimizer-nri-plugin.conf
+          sudo systemctl restart containerd
+          systemctl status containerd --no-pager -l
+      - name: Wait containerd ready
+        run: |
+          unset READY
+          for i in $(seq 30); do
+            if eval "timeout 180 ls /run/containerd/containerd.sock"; then
+                READY=true
+                break
+            fi
+            echo "Fail(${i}). Retrying..."
+            sleep 1
+          done
+          if [ "$READY" != "true" ];then
+            echo "containerd is not ready"
+            exit 1
+          fi
+      - name: Generate accessed files list
+        run: |
+          sed -i "s|host_path: script|host_path: $(pwd)/misc/optimizer/script|g" misc/optimizer/nginx.yaml
+          sudo crictl run misc/optimizer/nginx.yaml misc/optimizer/sandbox.yaml
+          sleep 20
+          sudo crictl rmp  -f --all
+          tree /opt/nri/optimizer/results/
+          count=$(cat /opt/nri/optimizer/results/library/nginx:1.23.3 | wc -l)
+          expected=$(cat misc/optimizer/script/file_list.txt | wc -l)
+          echo "count: $count expected minimum value: $expected"
+          if [ $count -lt $expected ]; then
+            echo "failed to generate accessed files list for nginx:1.23.3"
+            cat misc/optimizer/script/file_list.txt
+            exit 1
+          fi
+          cat /opt/nri/optimizer/results/library/nginx:1.23.3.csv
+      - name: Dump logs
+        if: failure()
+        continue-on-error: true
+        run: |
+          systemctl status containerd --no-pager -l
+          journalctl -xeu containerd --no-pager
+          

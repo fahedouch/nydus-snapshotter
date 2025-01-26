@@ -1,8 +1,9 @@
 /*
  * Copyright (c) 2021. Ant Financial. All rights reserved.
+  * Copyright (c) 2022. Nydus Developers. All rights reserved.
  *
  * SPDX-License-Identifier: Apache-2.0
- */
+*/
 
 package store
 
@@ -13,7 +14,10 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/containerd/log"
 	"github.com/containerd/nydus-snapshotter/pkg/daemon"
+	"github.com/containerd/nydus-snapshotter/pkg/errdefs"
+	"github.com/containerd/nydus-snapshotter/pkg/rafs"
 
 	"github.com/pkg/errors"
 	bolt "go.etcd.io/bbolt"
@@ -23,21 +27,21 @@ const (
 	databaseFileName = "nydus.db"
 )
 
-// Bucket names
-var (
-	daemonsBucketName = []byte("daemons") // Contains daemon info <daemon_id>=<daemon>
-
-	cachesBucketName   = []byte("caches")
-	snapshotBucketName = []byte("snapshots")
-
-	blobBucketName = []byte("blobs")
-)
+// Bucket names:
+// Buckets hierarchy:
+//	- v1:
+//		- daemons
+//		- instances
 
 var (
-	// ErrNotFound errors when the querying object not exists
-	ErrNotFound = errors.New("object not found")
-	// ErrAlreadyExists errors when duplicated object found
-	ErrAlreadyExists = errors.New("object already exists")
+	v1RootBucket = []byte("v1")
+	// Nydusd daemon instances.
+	// A daemon may host one (dedicated mode) or more (shared mode) RAFS filesystem instances.
+	versionKey    = []byte("version")
+	daemonsBucket = []byte("daemons")
+	// RAFS filesystem instances.
+	// A RAFS filesystem may have associated daemon or not.
+	instancesBucket = []byte("instances")
 )
 
 // Database keeps infos that need to survive among snapshotter restart
@@ -47,12 +51,14 @@ type Database struct {
 
 // NewDatabase creates a new or open existing database file
 func NewDatabase(rootDir string) (*Database, error) {
-	dbfile := filepath.Join(rootDir, databaseFileName)
-	if err := ensureDirectory(filepath.Dir(dbfile)); err != nil {
+	f := filepath.Join(rootDir, databaseFileName)
+	if err := ensureDirectory(filepath.Dir(f)); err != nil {
 		return nil, err
 	}
 
-	db, err := bolt.Open(dbfile, 0600, nil)
+	opts := bolt.Options{Timeout: time.Second * 4}
+
+	db, err := bolt.Open(f, 0600, &opts)
 	if err != nil {
 		return nil, err
 	}
@@ -71,99 +77,29 @@ func ensureDirectory(dir string) error {
 	return nil
 }
 
-func (d *Database) initDatabase() error {
-	return d.db.Update(func(tx *bolt.Tx) error {
-		if _, err := tx.CreateBucketIfNotExists(daemonsBucketName); err != nil {
-			return err
-		}
-		cbkt, err := tx.CreateBucketIfNotExists(cachesBucketName)
-		if err != nil {
-			return err
-		}
-		if _, err := cbkt.CreateBucketIfNotExists(snapshotBucketName); err != nil {
-			return err
-		}
-		if _, err := cbkt.CreateBucketIfNotExists(blobBucketName); err != nil {
-			return err
-		}
-		return nil
-	})
+func getDaemonsBucket(tx *bolt.Tx) *bolt.Bucket {
+	bucket := tx.Bucket(v1RootBucket)
+	return bucket.Bucket(daemonsBucket)
 }
 
-func (d *Database) Close() error {
-	err := d.db.Close()
+func getInstancesBucket(tx *bolt.Tx) *bolt.Bucket {
+	bucket := tx.Bucket(v1RootBucket)
+	return bucket.Bucket(instancesBucket)
+}
+
+func updateObject(bucket *bolt.Bucket, key string, obj interface{}) error {
+	keyBytes := []byte(key)
+
+	value, err := json.Marshal(obj)
 	if err != nil {
-		return errors.Wrapf(err, "Close boltdb failed")
+		return errors.Wrapf(err, "marshall key %s", key)
+	}
+
+	if err := bucket.Put(keyBytes, value); err != nil {
+		return errors.Wrapf(err, "put key %s", key)
 	}
 
 	return nil
-}
-
-// SaveDaemon saves daemon record from database
-func (d *Database) SaveDaemon(ctx context.Context, dmn *daemon.Daemon) error {
-	return d.db.Update(func(tx *bolt.Tx) error {
-		bucket := tx.Bucket(daemonsBucketName)
-
-		var existing daemon.Daemon
-		if err := getObject(bucket, dmn.ID, &existing); err == nil {
-			return ErrAlreadyExists
-		}
-
-		return putObject(bucket, dmn.ID, dmn)
-	})
-}
-
-// UpdateDaemon updates daemon record in the database
-func (d *Database) UpdateDaemon(ctx context.Context, dmn *daemon.Daemon) error {
-	return d.db.Update(func(tx *bolt.Tx) error {
-		bucket := tx.Bucket(daemonsBucketName)
-
-		var existing daemon.Daemon
-		if err := getObject(bucket, dmn.ID, &existing); err != nil {
-			return err
-		}
-
-		return updateObject(bucket, dmn.ID, dmn)
-	})
-}
-
-// DeleteDaemon deletes daemon record from database
-func (d *Database) DeleteDaemon(ctx context.Context, id string) error {
-	return d.db.Update(func(tx *bolt.Tx) error {
-		bucket := tx.Bucket(daemonsBucketName)
-
-		if err := bucket.Delete([]byte(id)); err != nil {
-			return errors.Wrapf(err, "failed to delete daemon for %q", id)
-		}
-
-		return nil
-	})
-}
-
-// WalkDaemons iterates all daemon records and invoke callback on each
-func (d *Database) WalkDaemons(ctx context.Context, cb func(info *daemon.Daemon) error) error {
-	return d.db.View(func(tx *bolt.Tx) error {
-		bucket := tx.Bucket(daemonsBucketName)
-		return bucket.ForEach(func(key, value []byte) error {
-			dmn := &daemon.Daemon{}
-			if err := json.Unmarshal(value, dmn); err != nil {
-				return errors.Wrapf(err, "failed to unmarshal %s", key)
-			}
-
-			return cb(dmn)
-		})
-	})
-}
-
-// Cleanup deletes all daemon records
-func (d *Database) CleanupDaemons(ctx context.Context) error {
-	return d.db.Update(func(tx *bolt.Tx) error {
-		bucket := tx.Bucket(daemonsBucketName)
-
-		return bucket.ForEach(func(k, _ []byte) error {
-			return bucket.Delete(k)
-		})
-	})
 }
 
 func putObject(bucket *bolt.Bucket, key string, obj interface{}) error {
@@ -175,165 +111,221 @@ func putObject(bucket *bolt.Bucket, key string, obj interface{}) error {
 
 	value, err := json.Marshal(obj)
 	if err != nil {
-		return errors.Wrapf(err, "failed to marshall object with key %q", key)
+		return errors.Wrapf(err, "marshall %s", key)
 	}
 
 	if err := bucket.Put(keyBytes, value); err != nil {
-		return errors.Wrapf(err, "failed to insert object with key %q", key)
+		return errors.Wrapf(err, "put key %s", key)
 	}
 
 	return nil
 }
 
-func updateObject(bucket *bolt.Bucket, key string, obj interface{}) error {
-	keyBytes := []byte(key)
-
-	value, err := json.Marshal(obj)
-	if err != nil {
-		return errors.Wrapf(err, "failed to marshall object with key %q", key)
-	}
-
-	if err := bucket.Put(keyBytes, value); err != nil {
-		return errors.Wrapf(err, "failed to insert object with key %q", key)
-	}
-
-	return nil
-}
-
+// A basic wrapper to retrieve a object from bucket.
 func getObject(bucket *bolt.Bucket, key string, obj interface{}) error {
 	if obj == nil {
-		return errors.Errorf("invalid arg: obj cannot be nil")
+		return errdefs.ErrInvalidArgument
 	}
 
 	value := bucket.Get([]byte(key))
 	if value == nil {
-		return ErrNotFound
+		return errdefs.ErrNotFound
 	}
 
 	if err := json.Unmarshal(value, obj); err != nil {
-		return errors.Wrapf(err, "failed to unmarshall object with key %q", key)
+		return errors.Wrapf(err, "unmarshall %s", key)
 	}
 
 	return nil
 }
 
-func (d *Database) addSnapshot(imageID string, snapshot *Snapshot) error {
-	return d.db.Update(func(tx *bolt.Tx) error {
-		cbkt := tx.Bucket(cachesBucketName)
-		sbkt, err := cbkt.CreateBucketIfNotExists(snapshotBucketName)
-		if err != nil {
-			return err
-		}
-		exist := &Snapshot{}
+func (db *Database) initDatabase() error {
+	var notV1 = false
+	var version string
+	err := db.db.Update(func(tx *bolt.Tx) error {
 
-		if err := getObject(sbkt, imageID, exist); err == nil {
-			exist.Blobs = snapshot.Blobs
-			exist.UpdateAt = time.Now()
-			return updateObject(sbkt, imageID, exist)
+		bk := tx.Bucket(v1RootBucket)
+		if bk == nil {
+			notV1 = true
 		}
 
-		return putObject(sbkt, imageID, snapshot)
-	})
-}
-
-func (d *Database) addBlob(blobID string, blob *Blob) error {
-	return d.db.Update(func(tx *bolt.Tx) error {
-		cbkt := tx.Bucket(cachesBucketName)
-		bbkt, err := cbkt.CreateBucketIfNotExists(blobBucketName)
+		// Must create v1 bucket
+		bk, err := tx.CreateBucketIfNotExists(v1RootBucket)
 		if err != nil {
 			return err
 		}
 
-		exist := &Blob{}
-		if err := getObject(bbkt, blobID, exist); err == nil {
-			exist.UpdateAt = time.Now()
-			return updateObject(bbkt, blobID, exist)
+		if _, err := bk.CreateBucketIfNotExists(daemonsBucket); err != nil {
+			return errors.Wrapf(err, "bucket %s", daemonsBucket)
 		}
-		return putObject(bbkt, blobID, blob)
-	})
-}
 
-func (d *Database) delSnapshot(imageID string) error {
-	return d.db.Update(func(tx *bolt.Tx) error {
-		cbkt := tx.Bucket(cachesBucketName)
-		sbkt, err := cbkt.CreateBucketIfNotExists(snapshotBucketName)
-		if err != nil {
-			return err
+		if _, err := bk.CreateBucketIfNotExists(instancesBucket); err != nil {
+			return errors.Wrapf(err, "bucket %s", instancesBucket)
 		}
-		if err := sbkt.Delete([]byte(imageID)); err != nil {
-			return err
+
+		if val := bk.Get(versionKey); val == nil {
+			version = "v1.0"
+		} else {
+			version = string(val)
 		}
+
 		return nil
 	})
-}
-
-func (d *Database) delBlob(blobID string) error {
-	return d.db.Update(func(tx *bolt.Tx) error {
-		cbkt := tx.Bucket(cachesBucketName)
-		bbkt, err := cbkt.CreateBucketIfNotExists(blobBucketName)
-		if err != nil {
-			return err
-		}
-		if err := bbkt.Delete([]byte(blobID)); err != nil {
-			return err
-		}
-		return nil
-	})
-}
-
-func (d *Database) getMarked() (map[string]struct{}, error) {
-	var results = make(map[string]struct{})
-	if err := d.db.View(func(tx *bolt.Tx) error {
-		cbkt := tx.Bucket(cachesBucketName)
-		sbkt := cbkt.Bucket(snapshotBucketName)
-
-		return sbkt.ForEach(func(k, v []byte) error {
-			snapshot := &Snapshot{}
-			if err := json.Unmarshal(v, snapshot); err != nil {
-				return err
-			}
-			for _, blobID := range snapshot.Blobs {
-				results[blobID] = struct{}{}
-			}
-			return nil
-		})
-	}); err != nil {
-		return nil, err
-	}
-	return results, nil
-}
-
-func (d *Database) walkBlobs(filter func(blobID string) bool) ([]string, error) {
-	var results []string
-	if err := d.db.View(func(tx *bolt.Tx) error {
-		cbkt := tx.Bucket(cachesBucketName)
-		bbkt := cbkt.Bucket(blobBucketName)
-
-		if err := bbkt.ForEach(func(k, v []byte) error {
-			key := string(k)
-			if filter(key) {
-				results = append(results, key)
-			}
-			return nil
-		}); err != nil {
-			return err
-		}
-		return nil
-	}); err != nil {
-		return nil, err
-	}
-	return results, nil
-}
-
-func (d *Database) getUnusedBlobs() ([]string, error) {
-	blobSeens, err := d.getMarked()
 	if err != nil {
-		return nil, err
+		return err
 	}
-	return d.walkBlobs(func(blob string) bool {
-		if _, ok := blobSeens[blob]; !ok {
-			return true
+
+	if notV1 {
+		if err := db.tryTranslateRecords(); err != nil && !errors.Is(err, errdefs.ErrNotFound) {
+			return errors.Wrapf(err, "convert old database")
 		}
-		return false
+	}
+
+	if version == "v1.0" {
+		if err := db.tryUpgradeRecords(version); err != nil && !errors.Is(err, errdefs.ErrNotFound) {
+			return errors.Wrapf(err, "convert old database")
+		}
+	}
+
+	return nil
+}
+
+func (db *Database) Close() error {
+	err := db.db.Close()
+	if err != nil {
+		return errors.Wrapf(err, "failed to close boltdb")
+	}
+
+	return nil
+}
+
+func (db *Database) SaveDaemon(_ context.Context, d *daemon.Daemon) error {
+	return db.db.Update(func(tx *bolt.Tx) error {
+		bucket := getDaemonsBucket(tx)
+		var existing daemon.ConfigState
+		if err := getObject(bucket, d.ID(), &existing); err == nil {
+			return errdefs.ErrAlreadyExists
+		}
+		return putObject(bucket, d.ID(), d.States)
 	})
+}
+
+func (db *Database) UpdateDaemon(_ context.Context, d *daemon.Daemon) error {
+	return db.db.Update(func(tx *bolt.Tx) error {
+		bucket := getDaemonsBucket(tx)
+
+		var existing daemon.ConfigState
+		if err := getObject(bucket, d.ID(), &existing); err != nil {
+			return err
+		}
+
+		return updateObject(bucket, d.ID(), d.States)
+	})
+}
+
+func (db *Database) DeleteDaemon(_ context.Context, id string) error {
+	return db.db.Update(func(tx *bolt.Tx) error {
+		bucket := getDaemonsBucket(tx)
+
+		if err := bucket.Delete([]byte(id)); err != nil {
+			return errors.Wrapf(err, "delete daemon %s", id)
+		}
+
+		return nil
+	})
+}
+
+// Cleanup deletes all daemon records
+func (db *Database) CleanupDaemons(_ context.Context) error {
+	return db.db.Update(func(tx *bolt.Tx) error {
+		bucket := getDaemonsBucket(tx)
+
+		return bucket.ForEach(func(k, _ []byte) error {
+			return bucket.Delete(k)
+		})
+	})
+}
+
+func (db *Database) WalkDaemons(_ context.Context, cb func(info *daemon.ConfigState) error) error {
+	return db.db.View(func(tx *bolt.Tx) error {
+		bucket := getDaemonsBucket(tx)
+
+		return bucket.ForEach(func(key, value []byte) error {
+			states := &daemon.ConfigState{}
+
+			if err := json.Unmarshal(value, states); err != nil {
+				return errors.Wrapf(err, "unmarshal %s", key)
+			}
+
+			return cb(states)
+		})
+	})
+}
+
+// WalkDaemons iterates all daemon records and invoke callback on each
+func (db *Database) WalkRafsInstances(_ context.Context, cb func(r *rafs.Rafs) error) error {
+	return db.db.View(func(tx *bolt.Tx) error {
+		bucket := getInstancesBucket(tx)
+
+		return bucket.ForEach(func(key, value []byte) error {
+			instance := &rafs.Rafs{}
+
+			if err := json.Unmarshal(value, instance); err != nil {
+				return errors.Wrapf(err, "unmarshal %s", key)
+			}
+
+			return cb(instance)
+		})
+	})
+}
+
+func (db *Database) AddRafsInstance(_ context.Context, instance *rafs.Rafs) error {
+	return db.db.Update(func(tx *bolt.Tx) error {
+		bucket := getInstancesBucket(tx)
+
+		return putObject(bucket, instance.SnapshotID, instance)
+	})
+}
+
+func (db *Database) DeleteRafsInstance(_ context.Context, snapshotID string) error {
+	return db.db.Update(func(tx *bolt.Tx) error {
+		bucket := getInstancesBucket(tx)
+
+		if err := bucket.Delete([]byte(snapshotID)); err != nil {
+			return errors.Wrapf(err, "instance snapshot ID %s", snapshotID)
+		}
+
+		return nil
+	})
+}
+
+func (db *Database) NextInstanceSeq() (uint64, error) {
+	tx, err := db.db.Begin(true)
+	if err != nil {
+		return 0, errors.New("failed to start transaction")
+	}
+
+	defer func() {
+		if err != nil {
+			if err := tx.Rollback(); err != nil {
+				log.L.WithError(err).Errorf("Rollback error when getting next sequence")
+			}
+		}
+	}()
+
+	bk := getInstancesBucket(tx)
+	if bk == nil {
+		return 0, errdefs.ErrNotFound
+	}
+
+	seq, err := bk.NextSequence()
+	if err != nil {
+		return 0, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+
+	return seq, nil
 }

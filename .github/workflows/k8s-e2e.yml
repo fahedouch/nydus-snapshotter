@@ -1,0 +1,63 @@
+name: E2E Test With Kubernetes Template
+
+on:
+  workflow_call:
+    inputs:
+      auth-type:
+        required: true
+        type: string
+
+env:
+  DOCKER_USER: testuser
+  DOCKER_PASSWORD: testpassword
+  NAMESPACE: nydus-system
+
+jobs:
+  e2e_tests_k8s:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Setup Golang
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'go.mod'
+          cache-dependency-path: "go.sum"
+      - name: Test
+        run: |
+          AUTH_TYPE='${{ inputs.auth-type }}'
+          ./tests/helpers/kind.sh
+      - name: Dump logs
+        if: failure()
+        continue-on-error: true
+        run: |
+          log_dir="/tmp/nydus-log"
+          mkdir -p $log_dir
+          for p in `kubectl --namespace "$NAMESPACE" get pods --no-headers -o custom-columns=NAME:metadata.name`; do
+           kubectl --namespace "$NAMESPACE" get pod $p -o yaml >> $log_dir/nydus-pods.conf
+           kubectl --namespace "$NAMESPACE" describe pod $p  >> $log_dir/nydus-pods.conf
+           kubectl --namespace "$NAMESPACE" logs $p -c nydus-snapshotter >> $log_dir/nydus-snapshotter.log || echo "failed to get snapshotter log"
+          done
+          kubectl --namespace "$NAMESPACE" get secrets -o yaml >> $log_dir/nydus-secrets.log
+
+          docker exec kind-control-plane cat /etc/containerd/config.toml >> $log_dir/containerd-config.toml
+          docker exec kind-control-plane containerd config dump >> $log_dir/containerd-config-dump.toml
+
+          docker exec kind-control-plane journalctl --no-pager -u containerd >> $log_dir/containerd.log
+          docker exec kind-control-plane journalctl --no-pager -u kubelet >> $log_dir/kubelet.log
+          docker exec kind-control-plane ps -ef >> $log_dir/psef.log
+
+          kubectl get pod test-pod -o yaml >> $log_dir/test-pod.log || echo "test-pod may be deleted or not created"
+
+          cat ~/.docker/config.json > $log_dir/docker.config.json || echo "~/.docker/config.json  not found"
+      - name: Upload Logs
+        uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: k8s-e2e-tests-logs
+          path: |
+            /tmp/nydus-log
+          overwrite: true

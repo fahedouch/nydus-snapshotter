@@ -11,7 +11,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -32,6 +32,8 @@ type NydusdConfig struct {
 	BlobCacheDir   string
 	APISockPath    string
 	MountPath      string
+	Mode           string
+	DigestValidate bool
 }
 
 // Nydusd runs nydusd binary.
@@ -57,15 +59,16 @@ var configTpl = `
 			}
 		}
 	},
-	"mode": "cached",
+	"mode": "{{.Mode}}",
 	"iostats_files": false,
 	"fs_prefetch": {
 		"enable": {{.EnablePrefetch}},
 		"threads_count": 10,
 		"merging_size": 131072
 	},
-	"digest_validate": true,
-	"enable_xattr": true
+	"digest_validate": {{.DigestValidate}},
+	"enable_xattr": true,
+	"amplify_io": 1048576
 }
 `
 
@@ -73,18 +76,11 @@ func makeConfig(conf NydusdConfig) error {
 	tpl := template.Must(template.New("").Parse(configTpl))
 
 	var ret bytes.Buffer
-	if conf.BackendType == "" {
-		conf.BackendType = "localfs"
-		conf.BackendConfig = `{"dir": "/fake"}`
-		conf.EnablePrefetch = false
-	} else {
-		conf.EnablePrefetch = true
-	}
 	if err := tpl.Execute(&ret, conf); err != nil {
 		return errors.New("prepare config template for Nydusd")
 	}
 
-	if err := ioutil.WriteFile(conf.ConfigPath, ret.Bytes(), 0644); err != nil {
+	if err := os.WriteFile(conf.ConfigPath, ret.Bytes(), 0600); err != nil {
 		return errors.New("write config file for Nydusd")
 	}
 
@@ -92,7 +88,7 @@ func makeConfig(conf NydusdConfig) error {
 }
 
 // Wait until Nydusd ready by checking daemon state RUNNING
-func checkReady(ctx context.Context, sock string) (<-chan bool, error) {
+func checkReady(ctx context.Context, sock string) <-chan bool {
 	ready := make(chan bool)
 
 	transport := &http.Transport{
@@ -127,7 +123,7 @@ func checkReady(ctx context.Context, sock string) (<-chan bool, error) {
 			}
 			defer resp.Body.Close()
 
-			body, err := ioutil.ReadAll(resp.Body)
+			body, err := io.ReadAll(resp.Body)
 			if err != nil {
 				continue
 			}
@@ -144,7 +140,7 @@ func checkReady(ctx context.Context, sock string) (<-chan bool, error) {
 		}
 	}()
 
-	return ready, nil
+	return ready
 }
 
 func NewNydusd(conf NydusdConfig) (*Nydusd, error) {
@@ -157,7 +153,8 @@ func NewNydusd(conf NydusdConfig) (*Nydusd, error) {
 }
 
 func (nydusd *Nydusd) Mount() error {
-	nydusd.Umount()
+	// Ignore the error since the nydusd may not ever start
+	_ = nydusd.Umount()
 
 	args := []string{
 		"--config",
@@ -184,10 +181,7 @@ func (nydusd *Nydusd) Mount() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	ready, err := checkReady(ctx, nydusd.APISockPath)
-	if err != nil {
-		return errors.New("check Nydusd state")
-	}
+	ready := checkReady(ctx, nydusd.APISockPath)
 
 	select {
 	case err := <-runErr:
